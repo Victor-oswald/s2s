@@ -9,6 +9,7 @@ import os
 import warnings
 from collections import deque
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+from fastapi import WebSocket
 
 warnings.filterwarnings("ignore", message=".*sequentially on GPU.*")
 

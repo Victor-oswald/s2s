@@ -6,12 +6,14 @@ import subprocess
 import threading
 import warnings
 import asyncio
+import base64
 from typing import Optional
 
 import torch
 import numpy as np
 import httpx
 import uvicorn
+import runpod
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
@@ -219,7 +221,7 @@ async def upload_custom_voice(
 @app.websocket("/ws/speech-to-speech")
 async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
     """
-    WebSocket endpoint accepting raw float32/int16 PCM bytes.
+    WebSocket endpoint accepting raw float32 PCM bytes.
     Routes transcribed text to the requested voice_id.
     """
     await websocket.accept()
@@ -318,5 +320,60 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
         print(f"[WebSocket Error] {e}")
 
 
+# --- RUNPOD SERVERLESS HANDLER ---
+
+async def runpod_handler(job):
+    """
+    Handles payload execution when triggered via RunPod Async Serverless API (/run).
+    Expected input format:
+    {
+        "input": {
+            "text": "Text to synthesize",
+            "voice_id": "eg"
+        }
+    }
+    """
+    job_input = job.get("input", {})
+    text_input = job_input.get("text")
+    voice_id = job_input.get("voice_id", "eg")
+
+    if not text_input:
+        return {"error": "No 'text' field provided in job payload input."}
+
+    payload = {
+        "model": "omnivoice",
+        "input": text_input,
+        "voice": voice_id,
+        "response_format": "wav"
+    }
+
+    try:
+        response = await http_client.post(OMNIVOICE_URL, json=payload, timeout=30.0)
+        if response.status_code == 200:
+            audio_b64 = base64.b64encode(response.content[44:]).decode('utf-8')
+            return {
+                "status": "success",
+                "text": text_input,
+                "voice_id": voice_id,
+                "audio_base64": audio_b64
+            }
+        else:
+            return {"error": f"OmniVoice engine returned HTTP {response.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, workers=1)
+    # If explicitly set to Serverless Execution Mode via Environment Variable
+    if os.getenv("SERVE_RUNPOD_HANDLER", "false").lower() == "true":
+        print("[RunPod] Booting in Serverless Worker Mode...")
+        
+        # Run startup lifecycle manually for serverless environments
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(startup_event())
+        
+        runpod.serverless.start({"handler": runpod_handler})
+    else:
+        # Default Mode: Dedicated Pod / HTTP / Direct Proxy Uvicorn Server
+        print("[RunPod] Booting in Standard FastAPI / WebSockets Proxy Mode...")
+        uvicorn.run("server:app", host="0.0.0.0", port=8000, workers=1)

@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
     TORCH_HOME=/runpod-volume/torch \
     VOLUME_PATH=/runpod-volume
 
-# Install system dependencies (ffmpeg is essential for multi-format audio conversion)
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
@@ -23,7 +23,7 @@ WORKDIR /app
 # Upgrade pip & build tools
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Install dependencies including FastAPI, async HTTP, and omnivoice-server
+# Install dependencies including FastAPI, async HTTP, omnivoice-server, and runpod
 RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
@@ -37,7 +37,7 @@ RUN pip install --no-cache-dir \
     omnivoice-server \
     runpod
 
-# Copy server entrypoint script
+# Copy application script
 COPY server.py /app/server.py
 
 # Create mount points for RunPod network volume
@@ -45,5 +45,5 @@ RUN mkdir -p /runpod-volume /workspace
 
 EXPOSE 8000
 
-# Launch server
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+# Launch combined entrypoint script
+CMD ["python", "-u", "server.py"]
