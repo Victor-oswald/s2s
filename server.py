@@ -4,6 +4,7 @@ import time
 import io
 import subprocess
 import threading
+import traceback
 import warnings
 import asyncio
 import base64
@@ -32,8 +33,13 @@ PROFILE_URL = f"{SERVER_BASE}/v1/voices/profiles"
 SAMPLE_RATE = 16000
 SILENCE_DURATION_SEC = 0.3
 
-# Ensure storage subdirectories exist
-os.makedirs(VOICE_DIR, exist_ok=True)
+# Ensure storage subdirectories exist (wrapped — a missing/unwritable volume
+# mount should not crash the whole process at import time)
+try:
+    os.makedirs(VOICE_DIR, exist_ok=True)
+except Exception:
+    print(f"[Startup] WARNING: could not create VOICE_DIR '{VOICE_DIR}':")
+    traceback.print_exc()
 
 app = FastAPI(title="RunPod Speech-to-Speech Engine with Voice Cloning")
 
@@ -41,39 +47,82 @@ app = FastAPI(title="RunPod Speech-to-Speech Engine with Voice Cloning")
 asr_pipe = None
 http_client: Optional[httpx.AsyncClient] = None
 omnivoice_process: Optional[subprocess.Popen] = None
+omnivoice_available = False
+asr_ready = False
+
+
+# --- HEALTH CHECK (required for RunPod Load Balancer endpoints) ---
+
+@app.get("/ping")
+async def health_check():
+    """
+    RunPod's Load Balancer worker type polls this route to decide whether
+    the worker is healthy enough to receive traffic. Must return 200 quickly.
+    We report 200 as soon as the process is up — ASR/TTS readiness is
+    reported separately in the body so you can debug without failing health.
+    """
+    return {
+        "status": "healthy",
+        "asr_ready": asr_ready,
+        "omnivoice_available": omnivoice_available,
+    }
 
 
 # --- SUBPROCESS MANAGEMENT FOR OMNIVOICE-SERVER ---
 
 def start_omnivoice_subprocess():
-    """Launches omnivoice-server in the background as a subprocess."""
+    """
+    Launches omnivoice-server in the background as a subprocess.
+    Never raises — a missing binary or bad launch should degrade the
+    service (no TTS) rather than crash the whole FastAPI startup.
+    """
     global omnivoice_process
     cmd = ["omnivoice-server", "--port", "8880"]
     print(f"[Subprocess] Starting OmniVoice server: {' '.join(cmd)}")
 
-    omnivoice_process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
+    try:
+        omnivoice_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        print("[Subprocess] FATAL: 'omnivoice-server' executable not found on PATH.")
+        print("[Subprocess] Check that the omnivoice-server pip package installed a")
+        print("[Subprocess] console-script entry point into an active/PATH'd env.")
+        omnivoice_process = None
+        return
+    except Exception:
+        print("[Subprocess] Unexpected error launching omnivoice-server:")
+        traceback.print_exc()
+        omnivoice_process = None
+        return
 
     def stream_logs():
-        for line in omnivoice_process.stdout:
-            print(f"[OmniVoice] {line}", end='')
+        try:
+            for line in omnivoice_process.stdout:
+                print(f"[OmniVoice] {line}", end='')
+        except Exception:
+            pass
 
     t = threading.Thread(target=stream_logs, daemon=True)
     t.start()
 
 
 async def wait_for_omnivoice_ready(timeout_s=90):
-    """Polls the local OmniVoice HTTP endpoint until up."""
+    """Polls the local OmniVoice HTTP endpoint until up. Returns False on timeout
+    or if the subprocess never started — never raises."""
+    if omnivoice_process is None:
+        print("[Subprocess] Skipping readiness check — omnivoice-server did not start.")
+        return False
+
     print("[Subprocess] Waiting for OmniVoice server to become reachable...")
     start = time.time()
     while time.time() - start < timeout_s:
         try:
-            response = await http_client.get(SERVER_BASE, timeout=2.0)
+            await http_client.get(SERVER_BASE, timeout=2.0)
             print("[Subprocess] OmniVoice server is reachable.")
             return True
         except (httpx.RequestError, httpx.HTTPError):
@@ -138,18 +187,40 @@ def load_local_whisper():
 
 @app.on_event("startup")
 async def startup_event():
-    global asr_pipe, http_client
+    """
+    IMPORTANT: an unhandled exception anywhere in this function will crash
+    uvicorn's startup and exit the process — which is exactly what produces
+    a fast, repeating "worker exited with exit code 1" crash loop on RunPod.
+    Every stage below is isolated in its own try/except so a single failing
+    component degrades the service instead of taking the whole worker down.
+    """
+    global asr_pipe, http_client, omnivoice_available, asr_ready
+
     http_client = httpx.AsyncClient(timeout=60.0)
 
-    # 1. Boot omnivoice-server CLI tool in background thread
-    start_omnivoice_subprocess()
-    server_ready = await wait_for_omnivoice_ready()
+    # 1. Boot omnivoice-server CLI tool in background thread (non-fatal)
+    try:
+        start_omnivoice_subprocess()
+        omnivoice_available = await wait_for_omnivoice_ready()
+    except Exception:
+        print("[Startup] Non-fatal error during OmniVoice startup:")
+        traceback.print_exc()
+        omnivoice_available = False
 
-    if not server_ready:
-        print("[Error] OmniVoice server failed to start. Continuing without TTS support.")
+    if not omnivoice_available:
+        print("[Startup] Continuing without TTS support (OmniVoice unavailable).")
 
-    # 2. Warm up ASR pipeline on CUDA
-    asr_pipe = load_local_whisper()
+    # 2. Warm up ASR pipeline on CUDA (fatal if it fails — but at least we
+    #    print a full traceback to the worker logs before exiting, instead
+    #    of a bare exit code 1 with no context)
+    try:
+        asr_pipe = load_local_whisper()
+        asr_ready = True
+    except Exception:
+        print("[Startup] FATAL: failed to load Whisper ASR pipeline:")
+        traceback.print_exc()
+        raise
+
     print("[Startup] System fully initialized and ready.")
 
 
@@ -158,7 +229,7 @@ async def shutdown_event():
     global omnivoice_process
     if http_client:
         await http_client.aclose()
-    
+
     if omnivoice_process and omnivoice_process.poll() is None:
         print("[Shutdown] Terminating OmniVoice process...")
         omnivoice_process.terminate()
@@ -260,6 +331,13 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
                 if len(recording) < SAMPLE_RATE * 0.3:
                     continue
 
+                if asr_pipe is None:
+                    await websocket.send_json({
+                        "event": "error",
+                        "message": "ASR pipeline is not ready yet."
+                    })
+                    continue
+
                 # 1. Transcribe audio using local Whisper
                 t_asr_start = time.time()
                 result = asr_pipe(
@@ -280,6 +358,16 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
                     continue
 
                 print(f"[STT] ({t_asr_end - t_asr_start:.2f}s): \"{spoken_text}\"")
+
+                if not omnivoice_available:
+                    await websocket.send_json({
+                        "event": "transcription",
+                        "text": spoken_text,
+                        "voice_id": voice_id,
+                        "warning": "OmniVoice TTS is unavailable; transcript only.",
+                        "latency": {"asr_sec": round(t_asr_end - t_asr_start, 3)}
+                    })
+                    continue
 
                 # 2. Dispatch to OmniVoice HTTP engine
                 payload = {
@@ -318,9 +406,10 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
         print("[WebSocket] Client disconnected.")
     except Exception as e:
         print(f"[WebSocket Error] {e}")
+        traceback.print_exc()
 
 
-# --- RUNPOD SERVERLESS HANDLER ---
+# --- RUNPOD SERVERLESS HANDLER (queue-based mode only) ---
 
 async def runpod_handler(job):
     """
@@ -364,16 +453,21 @@ async def runpod_handler(job):
 
 
 if __name__ == "__main__":
+    # RunPod injects PORT (and PORT_HEALTH) for Load Balancer endpoints.
+    # Always read it instead of hardcoding — a mismatched port is a common
+    # cause of workers that "start fine" but never receive traffic.
+    PORT = int(os.getenv("PORT", 8000))
+
     # If explicitly set to Serverless Execution Mode via Environment Variable
     if os.getenv("SERVE_RUNPOD_HANDLER", "false").lower() == "true":
-        print("[RunPod] Booting in Serverless Worker Mode...")
-        
+        print("[RunPod] Booting in Serverless Worker Mode (queue-based)...")
+
         # Run startup lifecycle manually for serverless environments
         loop = asyncio.get_event_loop()
         loop.run_until_complete(startup_event())
-        
+
         runpod.serverless.start({"handler": runpod_handler})
     else:
-        # Default Mode: Dedicated Pod / HTTP / Direct Proxy Uvicorn Server
-        print("[RunPod] Booting in Standard FastAPI / WebSockets Proxy Mode...")
-        uvicorn.run("server:app", host="0.0.0.0", port=8000, workers=1)
+        # Default Mode: Load Balancer / dedicated HTTP+WebSocket server
+        print(f"[RunPod] Booting in Load Balancer FastAPI/WebSocket Mode on port {PORT}...")
+        uvicorn.run("server:app", host="0.0.0.0", port=PORT, workers=1)
