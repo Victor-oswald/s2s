@@ -38,21 +38,19 @@ RUN pip install --no-cache-dir \
     runpod
 
 # --- CRITICAL: re-pin torch + torchvision + torchaudio to a matched triplet ---
-# Two separate problems showed up here:
-#   1. transformers (installed unpinned above) requires torch>=2.5, so
-#      pinning torch to the base image's 2.3.0 makes transformers disable
-#      its PyTorch backend entirely.
-#   2. omnivoice-server pulls in its own torchaudio dependency; left
-#      unpinned, pip resolved a torchaudio build compiled against CUDA 13
-#      (libcudart.so.13), which doesn't exist in this CUDA 12.1 image.
-# Fix: pin all THREE packages together as an official matched triplet built
-# for cu121, as the LAST pip step, so nothing upstream can swap any one of
-# them out independently again.
+# torch==2.5.1's own pinned nvidia-cudnn-cu12==9.1.0.70 has been pruned from
+# the cu121 wheel index — PyTorch's cu121 channel is being deprecated
+# (current stable installer no longer even lists cu121 as an option, only
+# 11.8/12.6/12.8). Move to the current stable triplet on a maintained
+# channel instead of chasing an aging pin.
+# cu126 wheels need host GPU driver >=525 — any RunPod GPU host in 2026
+# will comfortably satisfy this; verify with `nvidia-smi` in the pod if
+# torch.cuda.is_available() ever comes back False.
 RUN pip install --no-cache-dir \
-    torch==2.5.1 \
-    torchvision==0.20.1 \
-    torchaudio==2.5.1 \
-    --index-url https://download.pytorch.org/whl/cu121
+    torch==2.7.0 \
+    torchvision==0.22.0 \
+    torchaudio==2.7.0 \
+    --index-url https://download.pytorch.org/whl/cu126
 
 # Sanity check at build time: fail the build loudly here instead of
 # discovering the mismatch later in a crash-looping worker. This imports
