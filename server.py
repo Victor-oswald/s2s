@@ -294,19 +294,63 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
     """
     WebSocket endpoint accepting raw float32 PCM bytes.
     Routes transcribed text to the requested voice_id.
+
+    Structured as two concurrent coroutines instead of one sequential loop:
+
+      - `receiver()` does nothing but keep calling `websocket.receive_bytes()`
+        and pushing frames onto a queue. This is what lets the client keep
+        streaming mic audio (i.e. "listen") the entire time a previous
+        utterance is being transcribed/synthesized/played back, instead of
+        the socket read stalling until that turn finishes.
+      - `processor()` pulls frames off the queue and does the actual
+        silence-detection / ASR / TTS work, exactly as before. The Whisper
+        call now runs in a worker thread (`asyncio.to_thread`) rather than
+        inline on the event loop — previously that single blocking call
+        froze the *entire* server (every connection, this one included)
+        for its whole duration, which was the biggest chunk of the dead
+        time between "you stop talking" and "it starts responding".
+
+    A `send_lock` guards the socket so `send_json`/`send_bytes` calls from
+    `processor()` never interleave with each other (there's only ever one
+    writer, but the lock keeps this safe if you later add e.g. barge-in
+    interrupts that write from elsewhere).
     """
     await websocket.accept()
     print(f"[WebSocket] Client connected. Active Voice ID: '{voice_id}'")
 
-    audio_buffer = []
-    silent_chunks = 0
-    SILENCE_THRESHOLD = 0.035
+    audio_queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+    send_lock = asyncio.Lock()
 
-    try:
+    async def send_json_safe(payload):
+        async with send_lock:
+            await websocket.send_json(payload)
+
+    async def send_bytes_safe(payload):
+        async with send_lock:
+            await websocket.send_bytes(payload)
+
+    async def receiver():
+        try:
+            while True:
+                data = await websocket.receive_bytes()
+                if data:
+                    await audio_queue.put(data)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            # Sentinel — unblocks processor()'s queue.get() so it can exit
+            # cleanly once the client disconnects mid-turn.
+            await audio_queue.put(None)
+
+    async def processor():
+        audio_buffer = []
+        silent_chunks = 0
+        SILENCE_THRESHOLD = 0.035
+
         while True:
-            data = await websocket.receive_bytes()
-            if not data:
-                continue
+            data = await audio_queue.get()
+            if data is None:
+                return
 
             chunk = np.frombuffer(data, dtype=np.float32)
             clean_chunk = chunk - np.mean(chunk)
@@ -332,15 +376,18 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
                     continue
 
                 if asr_pipe is None:
-                    await websocket.send_json({
+                    await send_json_safe({
                         "event": "error",
                         "message": "ASR pipeline is not ready yet."
                     })
                     continue
 
-                # 1. Transcribe audio using local Whisper
+                # 1. Transcribe audio using local Whisper — run off the
+                # event loop so `receiver()` keeps draining the socket
+                # (i.e. you can keep talking) while this turn transcribes.
                 t_asr_start = time.time()
-                result = asr_pipe(
+                result = await asyncio.to_thread(
+                    asr_pipe,
                     recording,
                     generate_kwargs={
                         "language": "en",
@@ -360,7 +407,7 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
                 print(f"[STT] ({t_asr_end - t_asr_start:.2f}s): \"{spoken_text}\"")
 
                 if not omnivoice_available:
-                    await websocket.send_json({
+                    await send_json_safe({
                         "event": "transcription",
                         "text": spoken_text,
                         "voice_id": voice_id,
@@ -383,7 +430,7 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
 
                 if response.status_code == 200:
                     # Send transcript back to client
-                    await websocket.send_json({
+                    await send_json_safe({
                         "event": "transcription",
                         "text": spoken_text,
                         "voice_id": voice_id,
@@ -395,18 +442,27 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
 
                     # Send raw audio binary (stripping 44-byte WAV header)
                     audio_payload = response.content[44:]
-                    await websocket.send_bytes(audio_payload)
+                    await send_bytes_safe(audio_payload)
                 else:
-                    await websocket.send_json({
+                    await send_json_safe({
                         "event": "error",
                         "message": f"OmniVoice server returned status {response.status_code}"
                     })
 
+    receiver_task = asyncio.create_task(receiver())
+    try:
+        await processor()
     except WebSocketDisconnect:
         print("[WebSocket] Client disconnected.")
     except Exception as e:
         print(f"[WebSocket Error] {e}")
         traceback.print_exc()
+    finally:
+        receiver_task.cancel()
+        try:
+            await receiver_task
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            pass
 
 
 # --- RUNPOD SERVERLESS HANDLER (queue-based mode only) ---
