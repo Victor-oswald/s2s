@@ -30,8 +30,22 @@ RUN pip install --no-cache-dir \
     torchaudio==2.5.1 \
     --index-url https://download.pytorch.org/whl/cu121
 
-# Everything else EXCEPT omnivoice-server first.
+# A pip CONSTRAINTS file (not --no-deps) is the right tool here: pip still
+# resolves and installs every real dependency of omnivoice-server normally
+# (omnivoice, platformdirs, pydantic-settings, etc.) but is *forbidden* from
+# picking a different torch/torchvision/torchaudio than what's pinned below,
+# no matter what version omnivoice-server itself asks for. --no-deps was
+# too blunt — it blocked torch but also silently skipped every other
+# dependency, which is what broke the last build.
+RUN printf "torch==2.5.1\ntorchvision==0.20.1\ntorchaudio==2.5.1\n" > /tmp/torch-constraints.txt
+
+# Everything else, omnivoice-server included, resolved together under the
+# torch constraint. --extra-index-url so cu121 wheels are still reachable
+# for torch's own transitive re-check, while everything else still comes
+# from PyPI as usual.
 RUN pip install --no-cache-dir \
+    --constraint /tmp/torch-constraints.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu121 \
     fastapi \
     "uvicorn[standard]" \
     httpx \
@@ -40,21 +54,12 @@ RUN pip install --no-cache-dir \
     soundfile \
     numpy \
     python-multipart \
-    faster-whisper
+    faster-whisper \
+    omnivoice-server
 
-# Install omnivoice-server with --no-deps: it declares its own (unpinned)
-# torch requirement, and letting pip resolve that is exactly what silently
-# swapped out your pinned cu128 torch on the 5090 build with no error and
-# no warning. --no-deps means it can only use the torch already installed
-# above.
-RUN pip install --no-cache-dir --no-deps omnivoice-server
-
-# Re-assert the pinned torch build in case anything above touched it, then
-# fail the BUILD loudly (pip check) instead of finding out at runtime.
-RUN pip install --no-cache-dir --force-reinstall --no-deps \
-    torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
-    --index-url https://download.pytorch.org/whl/cu121 \
-    && pip check
+# Fail the BUILD loudly if the constraint didn't hold, instead of finding
+# out at runtime from garbled audio.
+RUN pip check && python -c "import torch; assert torch.__version__.startswith('2.5.1'), torch.__version__"
 
 # Build-time sanity check: this runs on a CPU builder so cuda=False here is
 # expected and NOT proof the GPU build is correct — the real check is
