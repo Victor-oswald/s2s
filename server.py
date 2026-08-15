@@ -33,6 +33,11 @@ PROFILE_URL = f"{SERVER_BASE}/v1/voices/profiles"
 SAMPLE_RATE = 16000
 SILENCE_DURATION_SEC = 0.3
 
+# Diffusion step count for OmniVoice synthesis. Their docs: "Use 16 for
+# faster inference" (default is 32). This is the single biggest lever for
+# per-utterance GPU time — tune via env without a code change/redeploy.
+TTS_NUM_STEP = int(os.getenv("OMNIVOICE_NUM_STEP", "16"))
+
 # Ensure storage subdirectories exist (wrapped — a missing/unwritable volume
 # mount should not crash the whole process at import time)
 try:
@@ -368,6 +373,7 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
 
             # Process when speech stops
             if len(audio_buffer) > 0 and current_silence_duration >= SILENCE_DURATION_SEC:
+                t_utterance_end = time.time()
                 recording = np.concatenate(audio_buffer, axis=0).flatten()
                 audio_buffer.clear()
                 silent_chunks = 0
@@ -416,38 +422,92 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
                     })
                     continue
 
-                # 2. Dispatch to OmniVoice HTTP engine
+                # 2. Dispatch to OmniVoice HTTP engine with streaming
+                # enabled — sentences land on the wire as each one finishes
+                # generating instead of waiting for the whole reply. Chunks
+                # come back as headerless raw PCM (matching the ASSUMED_*
+                # constants in wavUtils.js), so we forward each one straight
+                # to the client the moment it arrives — no more buffering
+                # the full response before sending anything.
                 payload = {
                     "model": "omnivoice",
                     "input": spoken_text,
                     "voice": voice_id,
-                    "response_format": "wav"
+                    "response_format": "pcm",
+                    "stream": True,
+                    "num_step": TTS_NUM_STEP,
+                    # Keeps timbre stable across streamed sentence chunks —
+                    # OmniVoice synthesizes each sentence independently when
+                    # streaming, and non-zero temperature can drift voice
+                    # from chunk to chunk otherwise.
+                    "position_temperature": 0.0,
                 }
 
                 t_tts_start = time.time()
-                response = await http_client.post(OMNIVOICE_URL, json=payload)
+                t_first_chunk = None
+                chunk_count = 0
+                sent_transcription = False
+
+                try:
+                    async with http_client.stream("POST", OMNIVOICE_URL, json=payload) as response:
+                        if response.status_code != 200:
+                            body = await response.aread()
+                            await send_json_safe({
+                                "event": "error",
+                                "message": f"OmniVoice server returned status {response.status_code}: {body[:200]!r}"
+                            })
+                            continue
+
+                        async for pcm_chunk in response.aiter_bytes():
+                            if not pcm_chunk:
+                                continue
+                            if t_first_chunk is None:
+                                t_first_chunk = time.time()
+                                # Send the transcript as soon as the first
+                                # chunk lands rather than after everything
+                                # finishes — the client shows it immediately.
+                                await send_json_safe({
+                                    "event": "transcription",
+                                    "text": spoken_text,
+                                    "voice_id": voice_id,
+                                    "latency": {
+                                        "asr_sec": round(t_asr_end - t_asr_start, 3),
+                                        "tts_first_chunk_sec": round(t_first_chunk - t_tts_start, 3),
+                                    }
+                                })
+                                sent_transcription = True
+                            chunk_count += 1
+                            await send_bytes_safe(pcm_chunk)
+                except httpx.RequestError as e:
+                    await send_json_safe({"event": "error", "message": f"OmniVoice request failed: {e}"})
+                    continue
+
                 t_tts_end = time.time()
 
-                if response.status_code == 200:
-                    # Send transcript back to client
+                if not sent_transcription:
+                    # Streamed zero bytes — surface something rather than
+                    # leaving the client with no transcript at all.
                     await send_json_safe({
                         "event": "transcription",
                         "text": spoken_text,
                         "voice_id": voice_id,
-                        "latency": {
-                            "asr_sec": round(t_asr_end - t_asr_start, 3),
-                            "tts_sec": round(t_tts_end - t_tts_start, 3)
-                        }
+                        "warning": "TTS produced no audio for this utterance.",
+                        "latency": {"asr_sec": round(t_asr_end - t_asr_start, 3)}
                     })
 
-                    # Send raw audio binary (stripping 44-byte WAV header)
-                    audio_payload = response.content[44:]
-                    await send_bytes_safe(audio_payload)
-                else:
-                    await send_json_safe({
-                        "event": "error",
-                        "message": f"OmniVoice server returned status {response.status_code}"
-                    })
+                # Full per-stage breakdown — this is what tells you whether
+                # a slow turn is socket/VAD, ASR, or TTS-bound instead of
+                # guessing. "silence_wait" is the fixed SILENCE_DURATION_SEC
+                # hangover baked into how utterance-end is detected.
+                print(
+                    "[Latency] "
+                    f"silence_wait={SILENCE_DURATION_SEC:.2f}s "
+                    f"asr={t_asr_end - t_asr_start:.2f}s "
+                    f"tts_first_chunk={((t_first_chunk or t_tts_end) - t_tts_start):.2f}s "
+                    f"tts_total={t_tts_end - t_tts_start:.2f}s "
+                    f"chunks={chunk_count} "
+                    f"end_of_speech_to_first_audio={((t_first_chunk or t_tts_end) - t_utterance_end):.2f}s"
+                )
 
     receiver_task = asyncio.create_task(receiver())
     try:
