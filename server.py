@@ -77,7 +77,7 @@ def start_omnivoice_subprocess():
     service (no TTS) rather than crash the whole FastAPI startup.
     """
     global omnivoice_process
-    cmd = ["omnivoice-server", "--port", "8880"]
+    cmd = ["omnivoice-server", "--port", "8880","--device", "cuda"]
     print(f"[Subprocess] Starting OmniVoice server: {' '.join(cmd)}")
 
     try:
