@@ -1,29 +1,25 @@
 import os
-import sys
 import time
-import io
 import subprocess
 import threading
 import traceback
 import warnings
 import asyncio
-import base64
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import numpy as np
 import httpx
 import uvicorn
-import runpod
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+from faster_whisper import WhisperModel
 
 warnings.filterwarnings("ignore", message=".*sequentially on GPU.*")
 
 # --- PATH & STORAGE CONFIGURATION ---
 VOLUME_PATH = os.getenv("VOLUME_PATH", "/runpod-volume")
-MODEL_DIR = os.getenv("MODEL_DIR", f"{VOLUME_PATH}/hub/models--openai--whisper-large-v3-turbo")
+MODEL_DIR = os.getenv("MODEL_DIR", "large-v3-turbo")  # faster-whisper shorthand or local CT2 dir
 VOICE_DIR = os.getenv("VOICE_DIR", f"{VOLUME_PATH}/voices")
 
 SERVER_BASE = os.getenv("OMNIVOICE_BASE_URL", "http://127.0.0.1:8880")
@@ -33,39 +29,49 @@ PROFILE_URL = f"{SERVER_BASE}/v1/voices/profiles"
 SAMPLE_RATE = 16000
 SILENCE_DURATION_SEC = 0.3
 
+# --- INCREMENTAL / PARTIAL TRANSCRIPTION TUNING ---
+# How often to re-transcribe the growing buffer while the user is still
+# speaking. Lower = faster to start speaking back, but more GPU churn.
+PARTIAL_INTERVAL_SEC = float(os.getenv("PARTIAL_INTERVAL_SEC", "0.7"))
+# Trailing words treated as "not yet safe to commit" since they're the most
+# likely to be rewritten by the next partial pass. Higher = fewer ASR
+# revision artifacts, but later first-audio.
+UNSTABLE_TAIL_WORDS = int(os.getenv("UNSTABLE_TAIL_WORDS", "3"))
+# Don't bother running a partial pass on a sliver of audio.
+MIN_PARTIAL_AUDIO_SEC = float(os.getenv("MIN_PARTIAL_AUDIO_SEC", "0.6"))
+SENTENCE_END_CHARS = (".", "!", "?")
+
+# --- PCM STREAM ALIGNMENT ---
+# Bytes per sample in the PCM OmniVoice streams back. int16 -> 2, float32 -> 4.
+# If audio still glitches after this fix, this is the first thing to check
+# against whatever OmniVoice actually emits for response_format="pcm".
+PCM_SAMPLE_WIDTH_BYTES = int(os.getenv("PCM_SAMPLE_WIDTH_BYTES", "2"))
+
 # Diffusion step count for OmniVoice synthesis. Their docs: "Use 16 for
 # faster inference" (default is 32). This is the single biggest lever for
 # per-utterance GPU time — tune via env without a code change/redeploy.
 TTS_NUM_STEP = int(os.getenv("OMNIVOICE_NUM_STEP", "16"))
 
-# Ensure storage subdirectories exist (wrapped — a missing/unwritable volume
-# mount should not crash the whole process at import time)
 try:
     os.makedirs(VOICE_DIR, exist_ok=True)
 except Exception:
     print(f"[Startup] WARNING: could not create VOICE_DIR '{VOICE_DIR}':")
     traceback.print_exc()
 
-app = FastAPI(title="RunPod Speech-to-Speech Engine with Voice Cloning")
+app = FastAPI(title="Pod Speech-to-Speech Engine with Voice Cloning")
 
 # Global variables
-asr_pipe = None
+asr_model: Optional[WhisperModel] = None
 http_client: Optional[httpx.AsyncClient] = None
 omnivoice_process: Optional[subprocess.Popen] = None
 omnivoice_available = False
 asr_ready = False
 
 
-# --- HEALTH CHECK (required for RunPod Load Balancer endpoints) ---
+# --- HEALTH CHECK ---
 
 @app.get("/ping")
 async def health_check():
-    """
-    RunPod's Load Balancer worker type polls this route to decide whether
-    the worker is healthy enough to receive traffic. Must return 200 quickly.
-    We report 200 as soon as the process is up — ASR/TTS readiness is
-    reported separately in the body so you can debug without failing health.
-    """
     return {
         "status": "healthy",
         "asr_ready": asr_ready,
@@ -73,16 +79,44 @@ async def health_check():
     }
 
 
+# --- GPU DIAGNOSTICS (runtime, not build time — build has no GPU) ---
+
+def log_gpu_diagnostics():
+    """
+    Build-time checks can only prove the imports don't crash — they run on a
+    CPU builder and always report cuda=False. This runs on the actual pod
+    with the actual GPU attached, so it's the only place that can confirm
+    you're really getting kernels for the GPU you rented, and not a torch
+    build that got silently swapped in by some other package's dependency
+    resolution (e.g. omnivoice-server pulling in its own torch).
+    """
+    print(f"[GPU] torch version: {torch.__version__}")
+    print(f"[GPU] torch CUDA build: {torch.version.cuda}")
+    print(f"[GPU] cuda available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        idx = torch.cuda.current_device()
+        name = torch.cuda.get_device_name(idx)
+        major, minor = torch.cuda.get_device_capability(idx)
+        arch_list = torch.cuda.get_arch_list()
+        print(f"[GPU] device: {name} (compute capability sm_{major}{minor})")
+        print(f"[GPU] torch built with arch support: {arch_list}")
+        if f"sm_{major}{minor}" not in arch_list:
+            print(
+                "[GPU] WARNING: this torch build does not list sm_"
+                f"{major}{minor} in its arch list. This usually means a "
+                "dependency (often omnivoice-server) pulled in a mismatched "
+                "torch wheel and overwrote the one you intended to run. "
+                "Check `pip show torch` inside the pod."
+            )
+    else:
+        print("[GPU] WARNING: CUDA not available — running on CPU.")
+
+
 # --- SUBPROCESS MANAGEMENT FOR OMNIVOICE-SERVER ---
 
 def start_omnivoice_subprocess():
-    """
-    Launches omnivoice-server in the background as a subprocess.
-    Never raises — a missing binary or bad launch should degrade the
-    service (no TTS) rather than crash the whole FastAPI startup.
-    """
     global omnivoice_process
-    cmd = ["omnivoice-server", "--port", "8880","--device", "cuda"]
+    cmd = ["omnivoice-server", "--port", "8880", "--device", "cuda"]
     print(f"[Subprocess] Starting OmniVoice server: {' '.join(cmd)}")
 
     try:
@@ -95,8 +129,6 @@ def start_omnivoice_subprocess():
         )
     except FileNotFoundError:
         print("[Subprocess] FATAL: 'omnivoice-server' executable not found on PATH.")
-        print("[Subprocess] Check that the omnivoice-server pip package installed a")
-        print("[Subprocess] console-script entry point into an active/PATH'd env.")
         omnivoice_process = None
         return
     except Exception:
@@ -117,8 +149,6 @@ def start_omnivoice_subprocess():
 
 
 async def wait_for_omnivoice_ready(timeout_s=90):
-    """Polls the local OmniVoice HTTP endpoint until up. Returns False on timeout
-    or if the subprocess never started — never raises."""
     if omnivoice_process is None:
         print("[Subprocess] Skipping readiness check — omnivoice-server did not start.")
         return False
@@ -137,7 +167,6 @@ async def wait_for_omnivoice_ready(timeout_s=90):
 
 
 async def register_voice_profile(profile_id: str, wav_path: str) -> bool:
-    """Registers an audio sample file with OmniVoice voice registry."""
     if not os.path.exists(wav_path):
         print(f"[Voice Registry] Reference audio file missing: {wav_path}")
         return False
@@ -159,51 +188,71 @@ async def register_voice_profile(profile_id: str, wav_path: str) -> bool:
         return False
 
 
-def load_local_whisper():
-    print(f"[Whisper] Loading model from path: {MODEL_DIR}...")
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
-    model_identifier = MODEL_DIR if os.path.exists(MODEL_DIR) else "openai/whisper-large-v3-turbo"
-
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_identifier,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-        cache_dir=f"{VOLUME_PATH}/huggingface"
-    ).to(device)
-
-    processor = AutoProcessor.from_pretrained(model_identifier, cache_dir=f"{VOLUME_PATH}/huggingface")
-
-    return pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        torch_dtype=torch_dtype,
+def load_asr_model() -> WhisperModel:
+    """
+    faster-whisper / CTranslate2 backend instead of the raw transformers
+    generate() loop — noticeably faster on GPU for the same weights, and
+    matches the backend you're already using in the local Windows pipeline.
+    """
+    print(f"[Whisper] Loading faster-whisper model: {MODEL_DIR}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    model = WhisperModel(
+        MODEL_DIR,
         device=device,
-        chunk_length_s=30,
-        batch_size=1,
+        compute_type=compute_type,
+        download_root=f"{VOLUME_PATH}/huggingface",
     )
+    print("[Whisper] Model loaded.")
+    return model
+
+
+def _transcribe_sync(audio: np.ndarray) -> str:
+    """Runs in a worker thread. Full transcript text for the given buffer."""
+    segments, _info = asr_model.transcribe(
+        audio,
+        language="en",
+        beam_size=1,
+        best_of=1,
+        condition_on_previous_text=False,
+        vad_filter=False,  # we already do our own VAD/silence detection
+    )
+    return "".join(seg.text for seg in segments).strip()
+
+
+def compute_committed_text(full_text: str, unstable_tail_words: int) -> str:
+    """
+    Splits off the trailing `unstable_tail_words` words (likely to be
+    revised by the next partial pass) and returns only the portion of what's
+    left up through the last completed clause — so we never hand OmniVoice
+    a sentence fragment that ends mid-thought.
+    """
+    words = full_text.split()
+    if len(words) <= unstable_tail_words:
+        return ""
+    committed = " ".join(words[:-unstable_tail_words]) if unstable_tail_words else " ".join(words)
+
+    last_end = -1
+    for ch in SENTENCE_END_CHARS:
+        last_end = max(last_end, committed.rfind(ch))
+    if last_end == -1:
+        # No full sentence yet — allow a comma boundary so long run-on
+        # sentences still get spoken incrementally instead of stalling.
+        last_end = committed.rfind(",")
+    if last_end == -1:
+        return ""
+    return committed[: last_end + 1].strip()
 
 
 # --- LIFECYCLE HOOKS ---
 
 @app.on_event("startup")
 async def startup_event():
-    """
-    IMPORTANT: an unhandled exception anywhere in this function will crash
-    uvicorn's startup and exit the process — which is exactly what produces
-    a fast, repeating "worker exited with exit code 1" crash loop on RunPod.
-    Every stage below is isolated in its own try/except so a single failing
-    component degrades the service instead of taking the whole worker down.
-    """
-    global asr_pipe, http_client, omnivoice_available, asr_ready
+    global asr_model, http_client, omnivoice_available, asr_ready
 
     http_client = httpx.AsyncClient(timeout=60.0)
+    log_gpu_diagnostics()
 
-    # 1. Boot omnivoice-server CLI tool in background thread (non-fatal)
     try:
         start_omnivoice_subprocess()
         omnivoice_available = await wait_for_omnivoice_ready()
@@ -215,14 +264,11 @@ async def startup_event():
     if not omnivoice_available:
         print("[Startup] Continuing without TTS support (OmniVoice unavailable).")
 
-    # 2. Warm up ASR pipeline on CUDA (fatal if it fails — but at least we
-    #    print a full traceback to the worker logs before exiting, instead
-    #    of a bare exit code 1 with no context)
     try:
-        asr_pipe = load_local_whisper()
+        asr_model = load_asr_model()
         asr_ready = True
     except Exception:
-        print("[Startup] FATAL: failed to load Whisper ASR pipeline:")
+        print("[Startup] FATAL: failed to load Whisper ASR model:")
         traceback.print_exc()
         raise
 
@@ -251,10 +297,6 @@ async def upload_custom_voice(
     profile_id: str = Form(...),
     file: UploadFile = File(...)
 ):
-    """
-    Accepts multiform voice samples (.mp3, .wav, .m4a, .flac), saves them to network volume,
-    and registers the voice with omnivoice-server.
-    """
     allowed_extensions = {".wav", ".mp3", ".m4a", ".flac"}
     file_ext = os.path.splitext(file.filename)[1].lower()
 
@@ -267,7 +309,6 @@ async def upload_custom_voice(
     saved_filename = f"{profile_id}{file_ext}"
     local_file_path = os.path.join(VOICE_DIR, saved_filename)
 
-    # Save audio stream to disk volume
     try:
         contents = await file.read()
         with open(local_file_path, "wb") as f:
@@ -275,7 +316,6 @@ async def upload_custom_voice(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to write audio file to storage: {e}")
 
-    # Register with the local OmniVoice registry
     success = await register_voice_profile(profile_id, local_file_path)
 
     if not success:
@@ -297,33 +337,27 @@ async def upload_custom_voice(
 @app.websocket("/ws/speech-to-speech")
 async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
     """
-    WebSocket endpoint accepting raw float32 PCM bytes.
-    Routes transcribed text to the requested voice_id.
+    Three concurrent coroutines:
 
-    Structured as two concurrent coroutines instead of one sequential loop:
-
-      - `receiver()` does nothing but keep calling `websocket.receive_bytes()`
-        and pushing frames onto a queue. This is what lets the client keep
-        streaming mic audio (i.e. "listen") the entire time a previous
-        utterance is being transcribed/synthesized/played back, instead of
-        the socket read stalling until that turn finishes.
-      - `processor()` pulls frames off the queue and does the actual
-        silence-detection / ASR / TTS work, exactly as before. The Whisper
-        call now runs in a worker thread (`asyncio.to_thread`) rather than
-        inline on the event loop — previously that single blocking call
-        froze the *entire* server (every connection, this one included)
-        for its whole duration, which was the biggest chunk of the dead
-        time between "you stop talking" and "it starts responding".
-
-    A `send_lock` guards the socket so `send_json`/`send_bytes` calls from
-    `processor()` never interleave with each other (there's only ever one
-    writer, but the lock keeps this safe if you later add e.g. barge-in
-    interrupts that write from elsewhere).
+      - `receiver()` keeps draining the socket into `audio_queue` no matter
+        what stage the rest of the pipeline is in.
+      - `partial_transcriber()` owns VAD/silence detection AND periodically
+        re-transcribes the growing buffer *while you're still talking*.
+        As soon as a clause is "stable" (won't be revised by more audio),
+        it's pushed onto `tts_queue` immediately — this is what lets
+        synthesis start before you finish your sentence, instead of
+        waiting for SILENCE_DURATION_SEC.
+      - `tts_worker()` drains `tts_queue` in order and streams each segment
+        to OmniVoice, forwarding PCM to the client as it arrives, with a
+        byte-alignment buffer so stream chunk boundaries never split a
+        sample across two WS frames (this was the source of the
+        intermittent noise/garbage audio).
     """
     await websocket.accept()
     print(f"[WebSocket] Client connected. Active Voice ID: '{voice_id}'")
 
     audio_queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+    tts_queue: "asyncio.Queue[Optional[tuple]]" = asyncio.Queue()
     send_lock = asyncio.Lock()
 
     async def send_json_safe(payload):
@@ -343,18 +377,56 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
         except WebSocketDisconnect:
             pass
         finally:
-            # Sentinel — unblocks processor()'s queue.get() so it can exit
-            # cleanly once the client disconnects mid-turn.
             await audio_queue.put(None)
 
-    async def processor():
-        audio_buffer = []
+    async def partial_transcriber():
+        audio_buffer: List[np.ndarray] = []
         silent_chunks = 0
         SILENCE_THRESHOLD = 0.035
+        last_partial_at = 0.0
+        dispatched_text = ""
+        utterance_id = 0
+        partial_lock = asyncio.Lock()  # prevent overlapping passes on this connection
+
+        async def run_partial_pass(is_final: bool):
+            nonlocal dispatched_text
+            if not audio_buffer:
+                return
+            recording = np.concatenate(audio_buffer, axis=0).flatten()
+            if len(recording) < SAMPLE_RATE * MIN_PARTIAL_AUDIO_SEC and not is_final:
+                return
+
+            async with partial_lock:
+                full_text = await asyncio.to_thread(_transcribe_sync, recording)
+                if not full_text:
+                    return
+
+                if is_final:
+                    committed = full_text  # full context, no tail trimming
+                else:
+                    committed = compute_committed_text(full_text, UNSTABLE_TAIL_WORDS)
+
+                if len(committed) <= len(dispatched_text):
+                    return
+                if not committed.startswith(dispatched_text):
+                    # ASR revised something already spoken — can't unspeak
+                    # audio, so just skip this pass and try again next time.
+                    print("[Partial] ASR revision conflict, skipping this pass.")
+                    return
+
+                delta = committed[len(dispatched_text):].strip()
+                if delta:
+                    print(f"[Partial{'/final' if is_final else ''}] +\"{delta}\"")
+                    await tts_queue.put(("text", utterance_id, delta))
+                    dispatched_text = committed
 
         while True:
             data = await audio_queue.get()
             if data is None:
+                if audio_buffer:
+                    await run_partial_pass(is_final=True)
+                    await tts_queue.put(("turn_complete", utterance_id, None))
+                await tts_queue.put(None)
                 return
 
             chunk = np.frombuffer(data, dtype=np.float32)
@@ -370,148 +442,132 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
                 audio_buffer.append(chunk)
 
             current_silence_duration = silent_chunks * chunk_duration
+            now = time.time()
 
-            # Process when speech stops
+            # Fire a partial pass periodically while still talking.
+            if audio_buffer and (now - last_partial_at) >= PARTIAL_INTERVAL_SEC:
+                last_partial_at = now
+                asyncio.create_task(run_partial_pass(is_final=False))
+
+            # End of utterance — final pass catches whatever the partial
+            # passes hadn't committed yet, then reset for the next turn.
             if len(audio_buffer) > 0 and current_silence_duration >= SILENCE_DURATION_SEC:
-                t_utterance_end = time.time()
-                recording = np.concatenate(audio_buffer, axis=0).flatten()
+                await run_partial_pass(is_final=True)
+                await tts_queue.put(("turn_complete", utterance_id, None))
                 audio_buffer.clear()
                 silent_chunks = 0
+                dispatched_text = ""
+                utterance_id += 1
 
-                if len(recording) < SAMPLE_RATE * 0.3:
-                    continue
+    async def tts_worker():
+        while True:
+            item = await tts_queue.get()
+            if item is None:
+                return
 
-                if asr_pipe is None:
-                    await send_json_safe({
-                        "event": "error",
-                        "message": "ASR pipeline is not ready yet."
-                    })
-                    continue
+            kind, utterance_id, text = item
 
-                # 1. Transcribe audio using local Whisper — run off the
-                # event loop so `receiver()` keeps draining the socket
-                # (i.e. you can keep talking) while this turn transcribes.
-                t_asr_start = time.time()
-                result = await asyncio.to_thread(
-                    asr_pipe,
-                    recording,
-                    generate_kwargs={
-                        "language": "en",
-                        "task": "transcribe",
-                        "num_beams": 1,
-                        "max_new_tokens": 128,
-                        "repetition_penalty": 1.3,
-                        "no_repeat_ngram_size": 3,
-                    }
-                )
-                spoken_text = result["text"].strip()
-                t_asr_end = time.time()
+            if kind == "turn_complete":
+                await send_json_safe({"event": "turn_complete", "utterance_id": utterance_id})
+                continue
 
-                if not spoken_text:
-                    continue
+            if not omnivoice_available:
+                await send_json_safe({
+                    "event": "transcription",
+                    "text": text,
+                    "voice_id": voice_id,
+                    "utterance_id": utterance_id,
+                    "warning": "OmniVoice TTS is unavailable; transcript only.",
+                })
+                continue
 
-                print(f"[STT] ({t_asr_end - t_asr_start:.2f}s): \"{spoken_text}\"")
+            payload = {
+                "model": "omnivoice",
+                "input": text,
+                "voice": voice_id,
+                "response_format": "pcm",
+                "stream": True,
+                "num_step": TTS_NUM_STEP,
+                "position_temperature": 0.0,
+            }
 
-                if not omnivoice_available:
-                    await send_json_safe({
-                        "event": "transcription",
-                        "text": spoken_text,
-                        "voice_id": voice_id,
-                        "warning": "OmniVoice TTS is unavailable; transcript only.",
-                        "latency": {"asr_sec": round(t_asr_end - t_asr_start, 3)}
-                    })
-                    continue
+            t_tts_start = time.time()
+            t_first_chunk = None
+            chunk_count = 0
+            sent_transcription = False
+            # Carries any trailing partial sample across chunk boundaries so
+            # a sample is never split across two WS binary frames.
+            pending_remainder = b""
 
-                # 2. Dispatch to OmniVoice HTTP engine with streaming
-                # enabled — sentences land on the wire as each one finishes
-                # generating instead of waiting for the whole reply. Chunks
-                # come back as headerless raw PCM (matching the ASSUMED_*
-                # constants in wavUtils.js), so we forward each one straight
-                # to the client the moment it arrives — no more buffering
-                # the full response before sending anything.
-                payload = {
-                    "model": "omnivoice",
-                    "input": spoken_text,
-                    "voice": voice_id,
-                    "response_format": "pcm",
-                    "stream": True,
-                    "num_step": TTS_NUM_STEP,
-                    # Keeps timbre stable across streamed sentence chunks —
-                    # OmniVoice synthesizes each sentence independently when
-                    # streaming, and non-zero temperature can drift voice
-                    # from chunk to chunk otherwise.
-                    "position_temperature": 0.0,
-                }
+            try:
+                async with http_client.stream("POST", OMNIVOICE_URL, json=payload) as response:
+                    if response.status_code != 200:
+                        body = await response.aread()
+                        await send_json_safe({
+                            "event": "error",
+                            "message": f"OmniVoice server returned status {response.status_code}: {body[:200]!r}",
+                            "utterance_id": utterance_id,
+                        })
+                        continue
 
-                t_tts_start = time.time()
-                t_first_chunk = None
-                chunk_count = 0
-                sent_transcription = False
-
-                try:
-                    async with http_client.stream("POST", OMNIVOICE_URL, json=payload) as response:
-                        if response.status_code != 200:
-                            body = await response.aread()
-                            await send_json_safe({
-                                "event": "error",
-                                "message": f"OmniVoice server returned status {response.status_code}: {body[:200]!r}"
-                            })
+                    async for raw_chunk in response.aiter_bytes():
+                        if not raw_chunk:
                             continue
 
-                        async for pcm_chunk in response.aiter_bytes():
-                            if not pcm_chunk:
-                                continue
-                            if t_first_chunk is None:
-                                t_first_chunk = time.time()
-                                # Send the transcript as soon as the first
-                                # chunk lands rather than after everything
-                                # finishes — the client shows it immediately.
-                                await send_json_safe({
-                                    "event": "transcription",
-                                    "text": spoken_text,
-                                    "voice_id": voice_id,
-                                    "latency": {
-                                        "asr_sec": round(t_asr_end - t_asr_start, 3),
-                                        "tts_first_chunk_sec": round(t_first_chunk - t_tts_start, 3),
-                                    }
-                                })
-                                sent_transcription = True
-                            chunk_count += 1
-                            await send_bytes_safe(pcm_chunk)
-                except httpx.RequestError as e:
-                    await send_json_safe({"event": "error", "message": f"OmniVoice request failed: {e}"})
-                    continue
+                        buf = pending_remainder + raw_chunk
+                        aligned_len = len(buf) - (len(buf) % PCM_SAMPLE_WIDTH_BYTES)
+                        to_send, pending_remainder = buf[:aligned_len], buf[aligned_len:]
+                        if not to_send:
+                            continue
 
-                t_tts_end = time.time()
+                        if t_first_chunk is None:
+                            t_first_chunk = time.time()
+                            await send_json_safe({
+                                "event": "transcription",
+                                "text": text,
+                                "voice_id": voice_id,
+                                "utterance_id": utterance_id,
+                                "latency": {
+                                    "tts_first_chunk_sec": round(t_first_chunk - t_tts_start, 3),
+                                },
+                            })
+                            sent_transcription = True
 
-                if not sent_transcription:
-                    # Streamed zero bytes — surface something rather than
-                    # leaving the client with no transcript at all.
-                    await send_json_safe({
-                        "event": "transcription",
-                        "text": spoken_text,
-                        "voice_id": voice_id,
-                        "warning": "TTS produced no audio for this utterance.",
-                        "latency": {"asr_sec": round(t_asr_end - t_asr_start, 3)}
-                    })
+                        chunk_count += 1
+                        await send_bytes_safe(to_send)
 
-                # Full per-stage breakdown — this is what tells you whether
-                # a slow turn is socket/VAD, ASR, or TTS-bound instead of
-                # guessing. "silence_wait" is the fixed SILENCE_DURATION_SEC
-                # hangover baked into how utterance-end is detected.
-                print(
-                    "[Latency] "
-                    f"silence_wait={SILENCE_DURATION_SEC:.2f}s "
-                    f"asr={t_asr_end - t_asr_start:.2f}s "
-                    f"tts_first_chunk={((t_first_chunk or t_tts_end) - t_tts_start):.2f}s "
-                    f"tts_total={t_tts_end - t_tts_start:.2f}s "
-                    f"chunks={chunk_count} "
-                    f"end_of_speech_to_first_audio={((t_first_chunk or t_tts_end) - t_utterance_end):.2f}s"
-                )
+                    if pending_remainder:
+                        # A trailing partial sample with nowhere left to go —
+                        # dropping a couple of bytes is inaudible; forwarding
+                        # it unaligned is what caused the glitches.
+                        print(f"[TTS] Dropped {len(pending_remainder)} trailing unaligned byte(s).")
+
+            except httpx.RequestError as e:
+                await send_json_safe({"event": "error", "message": f"OmniVoice request failed: {e}", "utterance_id": utterance_id})
+                continue
+
+            t_tts_end = time.time()
+            if not sent_transcription:
+                await send_json_safe({
+                    "event": "transcription",
+                    "text": text,
+                    "voice_id": voice_id,
+                    "utterance_id": utterance_id,
+                    "warning": "TTS produced no audio for this segment.",
+                })
+
+            print(
+                "[Latency] "
+                f"segment=\"{text[:40]}\" "
+                f"tts_first_chunk={((t_first_chunk or t_tts_end) - t_tts_start):.2f}s "
+                f"tts_total={t_tts_end - t_tts_start:.2f}s "
+                f"chunks={chunk_count}"
+            )
 
     receiver_task = asyncio.create_task(receiver())
+    transcriber_task = asyncio.create_task(partial_transcriber())
     try:
-        await processor()
+        await tts_worker()
     except WebSocketDisconnect:
         print("[WebSocket] Client disconnected.")
     except Exception as e:
@@ -519,71 +575,20 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
         traceback.print_exc()
     finally:
         receiver_task.cancel()
-        try:
-            await receiver_task
-        except (asyncio.CancelledError, WebSocketDisconnect):
-            pass
-
-
-# --- RUNPOD SERVERLESS HANDLER (queue-based mode only) ---
-
-async def runpod_handler(job):
-    """
-    Handles payload execution when triggered via RunPod Async Serverless API (/run).
-    Expected input format:
-    {
-        "input": {
-            "text": "Text to synthesize",
-            "voice_id": "eg"
-        }
-    }
-    """
-    job_input = job.get("input", {})
-    text_input = job_input.get("text")
-    voice_id = job_input.get("voice_id", "eg")
-
-    if not text_input:
-        return {"error": "No 'text' field provided in job payload input."}
-
-    payload = {
-        "model": "omnivoice",
-        "input": text_input,
-        "voice": voice_id,
-        "response_format": "wav"
-    }
-
-    try:
-        response = await http_client.post(OMNIVOICE_URL, json=payload, timeout=30.0)
-        if response.status_code == 200:
-            audio_b64 = base64.b64encode(response.content[44:]).decode('utf-8')
-            return {
-                "status": "success",
-                "text": text_input,
-                "voice_id": voice_id,
-                "audio_base64": audio_b64
-            }
-        else:
-            return {"error": f"OmniVoice engine returned HTTP {response.status_code}"}
-    except Exception as e:
-        return {"error": str(e)}
+        transcriber_task.cancel()
+        for t in (receiver_task, transcriber_task):
+            try:
+                await t
+            except (asyncio.CancelledError, WebSocketDisconnect):
+                pass
 
 
 if __name__ == "__main__":
-    # RunPod injects PORT (and PORT_HEALTH) for Load Balancer endpoints.
-    # Always read it instead of hardcoding — a mismatched port is a common
-    # cause of workers that "start fine" but never receive traffic.
+    # Pod mode: dedicated long-running HTTP+WebSocket server. No RunPod
+    # Serverless queue handler here — that code path (runpod.serverless.start)
+    # only applies to Serverless Workers, not a persistent Pod, and pulling
+    # in the `runpod` package for a Pod deployment is one more place a stray
+    # dependency resolution could silently swap out your pinned torch build.
     PORT = int(os.getenv("PORT", 8000))
-
-    # If explicitly set to Serverless Execution Mode via Environment Variable
-    if os.getenv("SERVE_RUNPOD_HANDLER", "false").lower() == "true":
-        print("[RunPod] Booting in Serverless Worker Mode (queue-based)...")
-
-        # Run startup lifecycle manually for serverless environments
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(startup_event())
-
-        runpod.serverless.start({"handler": runpod_handler})
-    else:
-        # Default Mode: Load Balancer / dedicated HTTP+WebSocket server
-        print(f"[RunPod] Booting in Load Balancer FastAPI/WebSocket Mode on port {PORT}...")
-        uvicorn.run("server:app", host="0.0.0.0", port=PORT, workers=1)
+    print(f"[Server] Booting FastAPI/WebSocket server on port {PORT}...")
+    uvicorn.run("server:app", host="0.0.0.0", port=PORT, workers=1)

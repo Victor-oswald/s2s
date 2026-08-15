@@ -20,34 +20,48 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# --- CRITICAL: CUDA 12.8 (cu128) is the minimum for sm_120 / RTX 5090 ---
+# --- 4090 / L40S are both Ada Lovelace (sm_89) ---
+# cu121 is plenty here; no need for the bleeding-edge cu128 build the 5090
+# (sm_120 / Blackwell) required. This is also less likely to trip whatever
+# kernel/wheel mismatch you hit on the 5090.
 RUN pip install --no-cache-dir \
-    torch==2.7.0 \
-    torchvision==0.22.0 \
-    torchaudio==2.7.0 \
-    --index-url https://download.pytorch.org/whl/cu128
+    torch==2.5.1 \
+    torchvision==0.20.1 \
+    torchaudio==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cu121
 
-# Install the rest. Because torch is already present, pip should not downgrade it.
+# Everything else EXCEPT omnivoice-server first.
 RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
     httpx \
-    transformers \
     accelerate \
     safetensors \
     soundfile \
     numpy \
     python-multipart \
-    omnivoice-server \
-    runpod
+    faster-whisper
 
-# Build-time sanity check: on a CPU builder this will show cuda=False,
-# but the arch list should include sm_120 if the wheel is correct.
-RUN python -c "import torch; \
-    print('torch', torch.__version__); \
-    print('cuda', torch.version.cuda); \
-    print('arch list', torch.cuda.get_arch_list() if torch.cuda.is_available() else 'N/A (CPU)'); \
-    import torchvision, torchaudio, transformers; \
+# Install omnivoice-server with --no-deps: it declares its own (unpinned)
+# torch requirement, and letting pip resolve that is exactly what silently
+# swapped out your pinned cu128 torch on the 5090 build with no error and
+# no warning. --no-deps means it can only use the torch already installed
+# above.
+RUN pip install --no-cache-dir --no-deps omnivoice-server
+
+# Re-assert the pinned torch build in case anything above touched it, then
+# fail the BUILD loudly (pip check) instead of finding out at runtime.
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+    torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cu121 \
+    && pip check
+
+# Build-time sanity check: this runs on a CPU builder so cuda=False here is
+# expected and NOT proof the GPU build is correct — the real check is
+# log_gpu_diagnostics() in server.py at container startup, which runs with
+# the actual GPU attached and will warn loudly if the arch doesn't match.
+RUN python -c "import torch, torchvision, torchaudio, faster_whisper; \
+    print('torch', torch.__version__, 'cuda build', torch.version.cuda); \
     print('imports OK')"
 
 COPY server.py /app/server.py
