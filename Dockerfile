@@ -1,5 +1,5 @@
-# Use PyTorch runtime base image with CUDA 12.1
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+# Use PyTorch runtime base image with CUDA 12.8
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -37,31 +37,26 @@ RUN pip install --no-cache-dir \
     omnivoice-server \
     runpod
 
-# --- CRITICAL: re-pin torch + torchvision + torchaudio to a matched triplet ---
-# torch==2.5.1's own pinned nvidia-cudnn-cu12==9.1.0.70 has been pruned from
-# the cu121 wheel index — PyTorch's cu121 channel is being deprecated
-# (current stable installer no longer even lists cu121 as an option, only
-# 11.8/12.6/12.8). Move to the current stable triplet on a maintained
-# channel instead of chasing an aging pin.
-# cu126 wheels need host GPU driver >=525 — any RunPod GPU host in 2026
-# will comfortably satisfy this; verify with `nvidia-smi` in the pod if
-# torch.cuda.is_available() ever comes back False.
+# --- CRITICAL: Install PyTorch 2.8.0 with CUDA 12.8 support for RTX 5090 ---
+# RTX 5090 requires compute capability sm_120 which is supported in PyTorch 2.7.1+
+# PyTorch 2.8.0 with CUDA 12.8 provides full support for RTX 5090
 RUN pip install --no-cache-dir \
-    torch==2.7.0 \
-    torchvision==0.22.0 \
-    torchaudio==2.7.0 \
-    --index-url https://download.pytorch.org/whl/cu126
+    torch==2.8.0 \
+    torchvision==0.23.0 \
+    torchaudio==2.8.0 \
+    --index-url https://download.pytorch.org/whl/cu128
 
 # Sanity check at build time: fail the build loudly here instead of
-# discovering the mismatch later in a crash-looping worker. This imports
-# every path that crashed in prior attempts: torchvision's custom ops
-# (transformers' AutoProcessor path) and torchaudio's compiled extension
-# (omnivoice's path).
+# discovering the mismatch later in a crash-looping worker.
 RUN python -c "import torch, torchvision, torchaudio; \
     print('torch', torch.__version__); \
     print('torchvision', torchvision.__version__); \
     print('torchaudio', torchaudio.__version__); \
     print('CUDA available:', torch.cuda.is_available()); \
+    if torch.cuda.is_available(): \
+        print('CUDA compute capability:', torch.cuda.get_device_capability(0)); \
+        print('CUDA device count:', torch.cuda.device_count()); \
+        print('CUDA device name:', torch.cuda.get_device_name(0)); \
     from torchvision.ops import nms; \
     print('torchvision::nms OK'); \
     import transformers; \
