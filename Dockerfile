@@ -39,10 +39,10 @@ RUN pip install --no-cache-dir \
 # dependency, which is what broke the last build.
 RUN printf "torch==2.5.1\ntorchvision==0.20.1\ntorchaudio==2.5.1\n" > /tmp/torch-constraints.txt
 
-# Everything else, omnivoice-server included, resolved together under the
-# torch constraint. --extra-index-url so cu121 wheels are still reachable
-# for torch's own transitive re-check, while everything else still comes
-# from PyPI as usual.
+# Everything except omnivoice-server (which we build from patched source
+# below), resolved together under the torch constraint. --extra-index-url
+# so cu121 wheels are still reachable for torch's own transitive re-check,
+# while everything else still comes from PyPI as usual.
 RUN pip install --no-cache-dir \
     --constraint /tmp/torch-constraints.txt \
     --extra-index-url https://download.pytorch.org/whl/cu121 \
@@ -54,8 +54,26 @@ RUN pip install --no-cache-dir \
     soundfile \
     numpy \
     python-multipart \
-    faster-whisper \
-    omnivoice-server
+    faster-whisper
+
+# --- omnivoice-server, patched with voice-clone embedding caching ---
+# Stock omnivoice-server re-runs OmniVoice's full reference-audio encode
+# (silence trim + RMS norm + a real GPU audio_tokenizer.encode() pass) on
+# EVERY /v1/audio/speech call, even for the same cached voice profile —
+# this was the fixed ~1.1-1.2s tax on every TTS request regardless of text
+# length. The patch adds a VoiceClonePrompt cache (in-memory + persisted to
+# disk) keyed by profile_id, built once and reused on every subsequent
+# call, and de-throttles the previous "torch.cuda.empty_cache() after every
+# single request" behavior to a periodic cleanup instead. Still resolved
+# under the same torch constraint as everything else above.
+COPY voice_clone_prompt_cache.patch /tmp/voice_clone_prompt_cache.patch
+RUN git clone --depth 1 https://github.com/maemreyo/omnivoice-server.git /opt/omnivoice-server-src \
+    && cd /opt/omnivoice-server-src \
+    && git apply /tmp/voice_clone_prompt_cache.patch \
+    && pip install --no-cache-dir \
+        --constraint /tmp/torch-constraints.txt \
+        --extra-index-url https://download.pytorch.org/whl/cu121 \
+        -e .
 
 # Fail the BUILD loudly if the constraint didn't hold, instead of finding
 # out at runtime from garbled audio.

@@ -100,11 +100,26 @@ def log_gpu_diagnostics():
         arch_list = torch.cuda.get_arch_list()
         print(f"[GPU] device: {name} (compute capability sm_{major}{minor})")
         print(f"[GPU] torch built with arch support: {arch_list}")
-        if f"sm_{major}{minor}" not in arch_list:
+        # Only the MAJOR compute-capability generation needs a matching (or
+        # lower, same-major) cubin/PTX entry — e.g. an Ada card (sm_89) runs
+        # fine on a wheel that only lists sm_80/sm_86, because those are
+        # forward-compatible within the same major (8.x) generation. Stock
+        # PyTorch wheels routinely omit sm_89 entirely for this reason, so
+        # checking for an EXACT "sm_89" match (as before) produces a false
+        # positive on every 40-series/L40/L40S card even when torch is
+        # perfectly correctly installed. Only warn if there's no same- or
+        # lower-major entry at all, which would mean the wheel genuinely
+        # can't target this GPU.
+        same_major_supported = any(
+            arch.startswith(f"sm_{major}") for arch in arch_list
+        ) or any(
+            int(arch.split("_")[1][0]) < major for arch in arch_list if arch.startswith("sm_")
+        )
+        if not same_major_supported:
             print(
-                "[GPU] WARNING: this torch build does not list sm_"
-                f"{major}{minor} in its arch list. This usually means a "
-                "dependency (often omnivoice-server) pulled in a mismatched "
+                "[GPU] WARNING: this torch build has no cubin/PTX compatible "
+                f"with compute capability {major}.{minor}. This usually means "
+                "a dependency (often omnivoice-server) pulled in a mismatched "
                 "torch wheel and overwrote the one you intended to run. "
                 "Check `pip show torch` inside the pod."
             )

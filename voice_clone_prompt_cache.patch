@@ -1,0 +1,337 @@
+diff --git a/omnivoice_server/routers/speech.py b/omnivoice_server/routers/speech.py
+index 46d75a0..d7962f6 100644
+--- a/omnivoice_server/routers/speech.py
++++ b/omnivoice_server/routers/speech.py
+@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, field_validator
+ 
+ from ..services.inference import InferenceService, SynthesisRequest, SynthesisResult
+ from ..services.metrics import MetricsService
++from ..services.model import ModelService
+ from ..services.profiles import ProfileNotFoundError, ProfileService
+ from ..utils.audio import (
+     ResponseFormat,
+@@ -84,6 +85,10 @@ def _get_profiles(request: Request) -> ProfileService:
+     return request.app.state.profile_svc
+ 
+ 
++def _get_model_svc(request: Request) -> ModelService:
++    return request.app.state.model_svc
++
++
+ def _get_metrics(request: Request) -> MetricsService:
+     return request.app.state.metrics_svc
+ 
+@@ -112,8 +117,14 @@ def _pcm_stream_response(stream_iter: AsyncIterator[bytes]) -> StreamingResponse
+ def _resolve_synthesis_mode(
+     body: SpeechRequest,
+     profile_svc: ProfileService,
+-) -> tuple[str, str | None, str | None, str | None]:
+-    """Resolve synthesis mode for /v1/audio/speech."""
++) -> tuple[str, str | None, str | None, str | None, str | None]:
++    """Resolve synthesis mode for /v1/audio/speech.
++
++    Returns (mode, instruct, ref_audio_path, ref_text, profile_id).
++    profile_id is only set for the "clone" mode and is used by the caller
++    to fetch/build a cached VoiceClonePrompt instead of re-encoding
++    ref_audio_path on every request.
++    """
+     logger.debug(
+         "[TRACE] _resolve_synthesis_mode called: speaker=%r, voice=%r, instructions=%r",
+         body.speaker,
+@@ -176,7 +187,7 @@ def _resolve_synthesis_mode(
+                 profile_id,
+                 ref_audio_path,
+             )
+-            return "clone", None, str(ref_audio_path), ref_text
++            return "clone", None, str(ref_audio_path), ref_text, profile_id
+         except ProfileNotFoundError:
+             if explicit_clone:
+                 logger.warning(f"[TRACE] Clone profile not found: {profile_id!r}")
+@@ -207,7 +218,7 @@ def _resolve_synthesis_mode(
+         try:
+             canonicalized = validate_and_canonicalize_instructions(body.instructions)
+             logger.info(f"[TRACE] Resolved to DESIGN mode (instructions): {canonicalized}")
+-            return "design", canonicalized, None, None
++            return "design", canonicalized, None, None, None
+         except InstructionValidationError as e:
+             raise HTTPException(
+                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+@@ -221,7 +232,7 @@ def _resolve_synthesis_mode(
+             speaker_key,
+             preset_instruct,
+         )
+-        return "design", preset_instruct, None, None
++        return "design", preset_instruct, None, None, None
+ 
+     if voice_preset:
+         preset_instruct = voice_preset
+@@ -230,7 +241,7 @@ def _resolve_synthesis_mode(
+             voice_key,
+             preset_instruct,
+         )
+-        return "design", preset_instruct, None, None
++        return "design", preset_instruct, None, None, None
+ 
+     if voice_raw:
+         design_voice = voice_raw
+@@ -239,13 +250,13 @@ def _resolve_synthesis_mode(
+         try:
+             canonicalized = validate_and_canonicalize_instructions(design_voice)
+             logger.info(f"[TRACE] Resolved to DESIGN mode (voice instructions): {canonicalized}")
+-            return "design", canonicalized, None, None
++            return "design", canonicalized, None, None, None
+         except InstructionValidationError as e:
+             if voice_raw.lower() == "auto":
+                 logger.info(
+                     f"[TRACE] Resolved to DESIGN mode (default): {DEFAULT_DESIGN_INSTRUCTIONS}"
+                 )
+-                return "design", DEFAULT_DESIGN_INSTRUCTIONS, None, None
++                return "design", DEFAULT_DESIGN_INSTRUCTIONS, None, None, None
+             if not is_openai_voice_preset(voice_raw):
+                 logger.warning(
+                     "[TRACE] Unsupported voice value=%r; rejecting instead of silent fallback",
+@@ -261,7 +272,7 @@ def _resolve_synthesis_mode(
+                 ) from e
+ 
+     logger.info(f"[TRACE] Resolved to DESIGN mode (default): {DEFAULT_DESIGN_INSTRUCTIONS}")
+-    return "design", DEFAULT_DESIGN_INSTRUCTIONS, None, None
++    return "design", DEFAULT_DESIGN_INSTRUCTIONS, None, None, None
+ 
+ 
+ @router.post("/audio/speech")
+@@ -269,11 +280,21 @@ async def create_speech(
+     body: SpeechRequest,
+     inference_svc: InferenceService = Depends(_get_inference),
+     profile_svc: ProfileService = Depends(_get_profiles),
++    model_svc: ModelService = Depends(_get_model_svc),
+     metrics_svc: MetricsService = Depends(_get_metrics),
+     cfg=Depends(_get_cfg),
+ ):
+     """Generate speech from text."""
+-    mode, instruct, ref_audio_path, ref_text = _resolve_synthesis_mode(body, profile_svc)
++    mode, instruct, ref_audio_path, ref_text, profile_id = _resolve_synthesis_mode(
++        body, profile_svc
++    )
++
++    # Fetch (or build+cache, on first use) the reusable VoiceClonePrompt for
++    # this profile instead of re-encoding ref_audio_path on every call — see
++    # ProfileService.get_voice_clone_prompt for why this matters.
++    voice_clone_prompt = None
++    if mode == "clone" and profile_id is not None:
++        voice_clone_prompt = profile_svc.get_voice_clone_prompt(profile_id, model_svc.model)
+ 
+     req = SynthesisRequest(
+         text=body.input,
+@@ -281,6 +302,7 @@ async def create_speech(
+         instruct=instruct,
+         ref_audio_path=ref_audio_path,
+         ref_text=ref_text,
++        voice_clone_prompt=voice_clone_prompt,
+         speed=body.speed,
+         num_step=body.num_step,
+         guidance_scale=body.guidance_scale,
+@@ -364,6 +386,7 @@ def _chunk_request(sentence: str, base_req: SynthesisRequest) -> SynthesisReques
+         instruct=base_req.instruct,
+         ref_audio_path=base_req.ref_audio_path,
+         ref_text=base_req.ref_text,
++        voice_clone_prompt=base_req.voice_clone_prompt,
+         speed=base_req.speed,
+         num_step=base_req.num_step,
+         guidance_scale=base_req.guidance_scale,
+diff --git a/omnivoice_server/services/inference.py b/omnivoice_server/services/inference.py
+index 544e61d..337e91a 100644
+--- a/omnivoice_server/services/inference.py
++++ b/omnivoice_server/services/inference.py
+@@ -13,6 +13,7 @@ from __future__ import annotations
+ import asyncio
+ import gc
+ import logging
++import os
+ import time
+ from concurrent.futures import ThreadPoolExecutor
+ from dataclasses import dataclass
+@@ -32,6 +33,9 @@ class SynthesisRequest:
+     instruct: str | None = None  # for mode="design"
+     ref_audio_path: str | None = None  # tmp path, for mode="clone"
+     ref_text: str | None = None  # for mode="clone", optional
++    voice_clone_prompt: object | None = None  # cached VoiceClonePrompt; takes
++    # priority over ref_audio_path when set — skips OmniVoice's internal
++    # re-encode (silence trim + RMS norm + audio_tokenizer.encode GPU pass)
+     speed: float = 1.0
+     num_step: int | None = None  # None → use server default
+     # Advanced passthrough — None means "use upstream default"
+@@ -130,7 +134,16 @@ class OmniVoiceAdapter:
+         if req.mode == "design" and req.instruct:
+             kwargs["instruct"] = req.instruct
+             logger.info(f"[TRACE] DESIGN mode kwargs prepared: instruct={req.instruct!r}")
++        elif req.mode == "clone" and req.voice_clone_prompt is not None:
++            # Fast path: cached VoiceClonePrompt, no re-encode of ref_audio.
++            kwargs["voice_clone_prompt"] = req.voice_clone_prompt
++            logger.info(
++                "[TRACE] CLONE mode kwargs prepared: using cached voice_clone_prompt "
++                "(no re-encode)"
++            )
+         elif req.mode == "clone" and req.ref_audio_path:
++            # Slow path: raw file, only hit for one-shot /audio/speech/clone
++            # uploads that have no saved profile to cache against.
+             kwargs["ref_audio"] = req.ref_audio_path
+             if req.ref_text:
+                 kwargs["ref_text"] = req.ref_text
+@@ -163,6 +176,8 @@ class OmniVoiceAdapter:
+             }
+             if "instruct" in kwargs:
+                 minimal["instruct"] = kwargs["instruct"]
++            if "voice_clone_prompt" in kwargs:
++                minimal["voice_clone_prompt"] = kwargs["voice_clone_prompt"]
+             if "ref_audio" in kwargs:
+                 minimal["ref_audio"] = kwargs["ref_audio"]
+             if "ref_text" in kwargs:
+@@ -233,8 +248,22 @@ class InferenceService:
+         )
+ 
+ 
++# torch.cuda.empty_cache() forces a CUDA sync and hands cached blocks back
++# to the driver — real work, not free bookkeeping. Doing it after every
++# single request (as before) taxes every turn of a live conversation just
++# to guard against slow, gradual memory growth. Do it periodically instead;
++# tune via OMNIVOICE_CLEANUP_INTERVAL (1 restores the old every-call behavior).
++_CLEANUP_INTERVAL = max(1, int(os.getenv("OMNIVOICE_CLEANUP_INTERVAL", "25")))
++_cleanup_counter = 0
++
++
+ def _cleanup_memory(device: str) -> None:
+-    """Post-inference memory cleanup to mitigate potential Torch memory growth."""
++    """Periodic post-inference memory cleanup to mitigate Torch memory growth."""
++    global _cleanup_counter
++    _cleanup_counter += 1
++    if _cleanup_counter % _CLEANUP_INTERVAL != 0:
++        return
++
+     gc.collect()
+     if device == "cuda":
+         try:
+diff --git a/omnivoice_server/services/profiles.py b/omnivoice_server/services/profiles.py
+index 86c3b59..6c247d3 100644
+--- a/omnivoice_server/services/profiles.py
++++ b/omnivoice_server/services/profiles.py
+@@ -13,13 +13,19 @@ from __future__ import annotations
+ import json
+ import logging
+ import shutil
++import time
+ from datetime import datetime, timezone
+ from pathlib import Path
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from omnivoice.models.omnivoice import VoiceClonePrompt
+ 
+ logger = logging.getLogger(__name__)
+ 
+ PROFILE_META_FILE = "meta.json"
+ PROFILE_AUDIO_FILE = "ref_audio.wav"
++PROFILE_PROMPT_CACHE_FILE = "voice_clone_prompt.pt"
+ 
+ 
+ class ProfileNotFoundError(Exception):
+@@ -33,6 +39,83 @@ class ProfileAlreadyExistsError(Exception):
+ class ProfileService:
+     def __init__(self, profile_dir: Path) -> None:
+         self._dir = profile_dir
++        # In-memory cache of VoiceClonePrompt per profile_id. This is the
++        # fix for the "every TTS call re-encodes the reference audio"
++        # latency tax: OmniVoice.create_voice_clone_prompt() runs silence
++        # trimming, RMS normalization, and a real GPU audio_tokenizer.encode()
++        # forward pass — that's the ~1.1-1.2s fixed cost we were paying on
++        # every single request, one word or eight. Doing it once per profile
++        # and reusing the resulting (small) token tensor skips all of that
++        # on every subsequent call.
++        self._prompt_cache: dict[str, "VoiceClonePrompt"] = {}
++
++    def get_voice_clone_prompt(self, profile_id: str, model) -> "VoiceClonePrompt":
++        """
++        Return a cached VoiceClonePrompt for profile_id, building (and
++        persisting) it on first use. Safe to call on every request — cache
++        hits are a dict lookup, no GPU work.
++        """
++        cached = self._prompt_cache.get(profile_id)
++        if cached is not None:
++            return cached
++
++        from omnivoice.models.omnivoice import VoiceClonePrompt
++
++        profile_path = self._profile_path(profile_id)
++        disk_cache_path = profile_path / PROFILE_PROMPT_CACHE_FILE
++
++        # Reuse a prompt persisted by a previous process (e.g. before a
++        # pod restart) instead of re-encoding from the raw wav again.
++        if disk_cache_path.exists():
++            try:
++                prompt = VoiceClonePrompt.load(str(disk_cache_path))
++                self._prompt_cache[profile_id] = prompt
++                logger.info(
++                    f"[VoiceClonePromptCache] Loaded persisted prompt for "
++                    f"'{profile_id}' from disk (skipped re-encode)."
++                )
++                return prompt
++            except Exception:
++                logger.warning(
++                    f"[VoiceClonePromptCache] Failed to load persisted prompt "
++                    f"for '{profile_id}'; re-encoding.",
++                    exc_info=True,
++                )
++
++        ref_audio_path = self.get_ref_audio_path(profile_id)  # raises ProfileNotFoundError
++        ref_text = self.get_ref_text(profile_id)
++
++        logger.info(
++            f"[VoiceClonePromptCache] Encoding reference audio for profile "
++            f"'{profile_id}' (one-time cost; all future calls reuse this)..."
++        )
++        t0 = time.monotonic()
++        prompt = model.create_voice_clone_prompt(str(ref_audio_path), ref_text)
++        elapsed = time.monotonic() - t0
++        logger.info(f"[VoiceClonePromptCache] Encoded '{profile_id}' in {elapsed:.2f}s.")
++
++        self._prompt_cache[profile_id] = prompt
++
++        try:
++            prompt.save(str(disk_cache_path))
++        except Exception:
++            logger.warning(
++                f"[VoiceClonePromptCache] Failed to persist prompt cache for "
++                f"'{profile_id}' to disk (non-fatal, still cached in memory).",
++                exc_info=True,
++            )
++
++        return prompt
++
++    def invalidate_voice_clone_prompt(self, profile_id: str) -> None:
++        """Drop cached prompt (memory + disk). Call after re-registering a profile."""
++        self._prompt_cache.pop(profile_id, None)
++        cache_path = self._profile_path(profile_id) / PROFILE_PROMPT_CACHE_FILE
++        if cache_path.exists():
++            try:
++                cache_path.unlink()
++            except OSError:
++                logger.warning(f"Failed to remove stale prompt cache for '{profile_id}'")
+ 
+     def list_profiles(self) -> list[dict]:
+         """Return list of profile metadata dicts."""
+@@ -80,6 +163,9 @@ class ProfileService:
+                 f"Profile '{profile_id}' already exists. Use overwrite=true to replace."
+             )
+ 
++        # New/changed reference audio means any cached embedding is stale.
++        self.invalidate_voice_clone_prompt(profile_id)
++
+         profile_path.mkdir(parents=True, exist_ok=True)
+ 
+         # Write audio
+@@ -104,6 +190,7 @@ class ProfileService:
+         profile_path = self._profile_path(profile_id)
+         if not profile_path.exists():
+             raise ProfileNotFoundError(f"Profile '{profile_id}' not found")
++        self._prompt_cache.pop(profile_id, None)
+         shutil.rmtree(profile_path)
+         logger.info(f"Deleted profile '{profile_id}'")
