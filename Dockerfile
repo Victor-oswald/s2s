@@ -61,15 +61,18 @@ RUN pip install --no-cache-dir \
 # (silence trim + RMS norm + a real GPU audio_tokenizer.encode() pass) on
 # EVERY /v1/audio/speech call, even for the same cached voice profile —
 # this was the fixed ~1.1-1.2s tax on every TTS request regardless of text
-# length. The patch adds a VoiceClonePrompt cache (in-memory + persisted to
-# disk) keyed by profile_id, built once and reused on every subsequent
-# call, and de-throttles the previous "torch.cuda.empty_cache() after every
-# single request" behavior to a periodic cleanup instead. Still resolved
-# under the same torch constraint as everything else above.
-COPY voice_clone_prompt_cache.patch /tmp/voice_clone_prompt_cache.patch
-RUN git clone --depth 1 https://github.com/maemreyo/omnivoice-server.git /opt/omnivoice-server-src \
-    && cd /opt/omnivoice-server-src \
-    && git apply /tmp/voice_clone_prompt_cache.patch \
+# length. The three files below add a VoiceClonePrompt cache (in-memory +
+# persisted to disk) keyed by profile_id, built once and reused on every
+# subsequent call, and de-throttle the previous "torch.cuda.empty_cache()
+# after every single request" behavior to a periodic cleanup instead.
+# Shipped as full file replacements (not a .patch) — git apply's patch
+# format is fragile across git versions/line-ending handling, and a full
+# file swap has nothing to corrupt.
+RUN git clone --depth 1 https://github.com/maemreyo/omnivoice-server.git /opt/omnivoice-server-src
+COPY omnivoice_server_patch/profiles.py /opt/omnivoice-server-src/omnivoice_server/services/profiles.py
+COPY omnivoice_server_patch/inference.py /opt/omnivoice-server-src/omnivoice_server/services/inference.py
+COPY omnivoice_server_patch/speech.py /opt/omnivoice-server-src/omnivoice_server/routers/speech.py
+RUN cd /opt/omnivoice-server-src \
     && pip install --no-cache-dir \
         --constraint /tmp/torch-constraints.txt \
         --extra-index-url https://download.pytorch.org/whl/cu121 \
