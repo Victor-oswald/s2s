@@ -52,6 +52,19 @@ PCM_SAMPLE_WIDTH_BYTES = int(os.getenv("PCM_SAMPLE_WIDTH_BYTES", "2"))
 # per-utterance GPU time — tune via env without a code change/redeploy.
 TTS_NUM_STEP = int(os.getenv("OMNIVOICE_NUM_STEP", "16"))
 
+# --- SESSION OWNERSHIP & BACKEND CLEANUP ---
+# This pod is provisioned for exactly one user (see helpers.php:
+# runpodCreatePodWithFallback), which sets these three at creation time.
+# They let this process report itself in for teardown/billing without
+# needing the client to tell it who it is.
+POD_USER_ID = os.getenv("USER_ID", "")
+CLEANUP_SECRET = os.getenv("CLEANUP_SECRET", "")
+CLEANUP_URL = os.getenv("CLEANUP_URL", "https://studio.flitaid.com/api/v1/cleanup.php")
+# How long to wait after a WebSocket disconnect before treating the session
+# as truly over. Long enough to survive a brief network blip / app restart
+# reconnect, short enough that a genuinely-gone user isn't left billing.
+DISCONNECT_GRACE_SEC = float(os.getenv("DISCONNECT_GRACE_SEC", "8"))
+
 try:
     os.makedirs(VOICE_DIR, exist_ok=True)
 except Exception:
@@ -67,6 +80,17 @@ omnivoice_process: Optional[subprocess.Popen] = None
 omnivoice_available = False
 asr_ready = False
 
+# --- Connection-generation tracking for disconnect handling ---
+# Every new WebSocket connection bumps `_connection_generation`. When a
+# connection closes, it schedules a cleanup task tagged with the generation
+# it saw at connect time. If a newer connection shows up before that task
+# fires, the generation numbers no longer match and the cleanup is skipped
+# (or actively cancelled if it was still pending) — that's a reconnect, not
+# an abandonment.
+_connection_generation = 0
+_pending_cleanup_task: Optional[asyncio.Task] = None
+_connection_state_lock = asyncio.Lock()
+
 
 # --- HEALTH CHECK ---
 
@@ -77,6 +101,48 @@ async def health_check():
         "asr_ready": asr_ready,
         "omnivoice_available": omnivoice_available,
     }
+
+
+# --- BACKEND CLEANUP REPORTING ---
+
+async def trigger_backend_cleanup(reason: str):
+    """
+    Tells the PHP backend this pod's session is over: it will bill for any
+    final elapsed time, terminate this pod via the RunPod API, and delete
+    the active_sessions row. Only fires if this pod actually knows who it
+    belongs to and how to authenticate to the backend — both set at pod
+    creation time. If either is missing, this is a no-op (rather than
+    guessing/crashing), so a misconfigured deployment just logs instead of
+    silently failing to bill.
+    """
+    if not POD_USER_ID or not CLEANUP_SECRET:
+        print(f"[Cleanup] Skipped ({reason}) — USER_ID/CLEANUP_SECRET not set on this pod.")
+        return
+
+    print(f"[Cleanup] Notifying backend ({reason}) for user_id={POD_USER_ID}")
+    try:
+        resp = await http_client.post(
+            CLEANUP_URL,
+            json={"user_id": POD_USER_ID, "secret": CLEANUP_SECRET},
+            timeout=10.0,
+        )
+        print(f"[Cleanup] Backend responded with status {resp.status_code}")
+    except Exception as e:
+        print(f"[Cleanup] Failed to notify backend: {e}")
+
+
+async def schedule_disconnect_cleanup(generation: int):
+    """
+    Waits DISCONNECT_GRACE_SEC after a disconnect, then — only if no newer
+    connection has taken over in the meantime — reports the session as
+    over to the backend.
+    """
+    await asyncio.sleep(DISCONNECT_GRACE_SEC)
+    async with _connection_state_lock:
+        if generation != _connection_generation:
+            # A reconnect happened after this disconnect — nothing to do.
+            return
+    await trigger_backend_cleanup("disconnect grace period expired")
 
 
 # --- GPU DIAGNOSTICS (runtime, not build time — build has no GPU) ---
@@ -268,6 +334,14 @@ async def startup_event():
     http_client = httpx.AsyncClient(timeout=60.0)
     log_gpu_diagnostics()
 
+    if not POD_USER_ID or not CLEANUP_SECRET:
+        print(
+            "[Startup] WARNING: USER_ID/CLEANUP_SECRET not set on this pod — "
+            "disconnect-triggered cleanup and billing settlement will be "
+            "skipped. This pod was likely started outside the normal "
+            "start.php provisioning flow."
+        )
+
     try:
         start_omnivoice_subprocess()
         omnivoice_available = await wait_for_omnivoice_ready()
@@ -285,6 +359,9 @@ async def startup_event():
     except Exception:
         print("[Startup] FATAL: failed to load Whisper ASR model:")
         traceback.print_exc()
+        # This pod can't do its job — tell the backend to settle billing
+        # and tear it down rather than leaving a dead session on the meter.
+        await trigger_backend_cleanup("fatal ASR load failure at startup")
         raise
 
     print("[Startup] System fully initialized and ready.")
@@ -367,9 +444,26 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
         byte-alignment buffer so stream chunk boundaries never split a
         sample across two WS frames (this was the source of the
         intermittent noise/garbage audio).
+
+    On top of that, connect/disconnect bumps `_connection_generation` and
+    drives the disconnect-grace-period cleanup: see
+    `schedule_disconnect_cleanup` / `trigger_backend_cleanup` above. This is
+    what notices "the user dropped the connection and never came back" and
+    reports it to the backend so the pod gets billed-and-terminated instead
+    of sitting there idle and unbilled.
     """
+    global _connection_generation, _pending_cleanup_task
+
+    async with _connection_state_lock:
+        _connection_generation += 1
+        my_generation = _connection_generation
+        if _pending_cleanup_task and not _pending_cleanup_task.done():
+            _pending_cleanup_task.cancel()
+            _pending_cleanup_task = None
+            print("[WebSocket] Reconnected within grace period — cancelled pending cleanup.")
+
     await websocket.accept()
-    print(f"[WebSocket] Client connected. Active Voice ID: '{voice_id}'")
+    print(f"[WebSocket] Client connected (gen={my_generation}). Active Voice ID: '{voice_id}'")
 
     audio_queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
     tts_queue: "asyncio.Queue[Optional[tuple]]" = asyncio.Queue()
@@ -596,6 +690,17 @@ async def speech_to_speech_endpoint(websocket: WebSocket, voice_id: str = "eg"):
                 await t
             except (asyncio.CancelledError, WebSocketDisconnect):
                 pass
+
+        # Connection is fully torn down at this point. Start the grace
+        # timer — if a new connection arrives and bumps the generation
+        # counter before it fires, that reconnect will cancel it.
+        async with _connection_state_lock:
+            if my_generation == _connection_generation:
+                print(
+                    f"[WebSocket] Connection gen={my_generation} closed — "
+                    f"starting {DISCONNECT_GRACE_SEC}s grace period before cleanup."
+                )
+                _pending_cleanup_task = asyncio.create_task(schedule_disconnect_cleanup(my_generation))
 
 
 if __name__ == "__main__":
