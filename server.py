@@ -59,7 +59,7 @@ TTS_NUM_STEP = int(os.getenv("OMNIVOICE_NUM_STEP", "16"))
 # needing the client to tell it who it is.
 POD_USER_ID = os.getenv("USER_ID", "")
 CLEANUP_SECRET = os.getenv("CLEANUP_SECRET", "")
-CLEANUP_URL = os.getenv("CLEANUP_URL", "https://studio.flitaid.com/api/v1/cleanup.php")
+CLEANUP_URL = os.getenv("CLEANUP_URL", "https://studio.flitaid.com/cleanup")
 # How long to wait after a WebSocket disconnect before treating the session
 # as truly over. Long enough to survive a brief network blip / app restart
 # reconnect, short enough that a genuinely-gone user isn't left billing.
