@@ -124,6 +124,7 @@ async def trigger_backend_cleanup(reason: str):
         resp = await http_client.post(
             CLEANUP_URL,
             json={"user_id": POD_USER_ID, "secret": CLEANUP_SECRET},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; FlitaidCleanupAgent/1.0)"},
             timeout=10.0,
         )
         print(f"[Cleanup] Backend responded with status {resp.status_code}")
